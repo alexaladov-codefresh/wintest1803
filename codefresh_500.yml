@@ -1,0 +1,526 @@
+version: '1.0'
+fail_fast: false
+
+
+stages:
+ - prepare
+ - tool
+ - common
+ - infra
+ - apps_build
+ - apps_tests
+ - apps_push
+ - deploy
+ - notification
+
+steps:
+
+  # ---- Preparation ---- #
+
+  main_clone:
+    stage: prepare
+    type: git-clone
+    title: Clone git repository
+    description: Clone git repository
+    repo: Backend-Trading/${{CF_REPO_NAME}}
+    revision: '${{CF_REVISION}}'
+    git: git_pbs_one
+    retry:
+      maxAttempts: 5
+      delay: 5
+      exponentialFactor: 2
+
+  get_changed_setup_envs:
+    stage: prepare
+    title: Identify Modified Entities + Setup Environment Variables
+    description: |-
+      Identifies files that have changed between the triggering revision and its first-parent,
+      exporting them as a pipe-separated list.  This can be searched as follows:
+        includes('${{changed_things}}', '|path/to/changed/dir/or.file')
+      For complete accuracy, searches for directories should be /-terminated, searches for
+      files should be |-terminated.
+    image: codefresh/cli
+    when:
+      steps:
+        - name: main_clone
+    working_directory: ${{main_clone}}
+    commands:
+      - cf_export changed_things=\|$(git diff --name-only ${{CF_REVISION}}~1 ${{CF_REVISION}} | tr '\n' '|')
+      - cf_export PROJ_DIR=${PWD}
+
+  # ---- Tool Images ---- #
+
+  build_tool_image_exists:
+    stage: tool
+    title: Check If Tool Image Exists
+    image: nexus.pbs.one/backend-trading/matchermanagement/codefresh/tool:master
+    working_directory: ${{main_clone}}
+    commands:
+      - |-
+        ./.codefresh/bin/image-exists.sh                                  \
+          "nexus.pbs.one/backend-trading/eventmanagement/codefresh/tool"  \
+          ${{CF_BRANCH_TAG_NORMALIZED}}                                   \
+          BUILD_TOOL_IMAGE_EXISTS         `# BUILT_INDICATOR`             \
+          ""
+
+  build_tool_if_changed:
+    stage: tool
+    title: Check If Tool Has Changed
+    image: codefresh/cli
+    working_directory: ${{main_clone}}
+    commands:
+      - |-
+        ./.codefresh/bin/cf-export-if-changed.sh           \
+          "$changed_things"                              \
+          .codefresh/images        `# WATCHED_LOCATION`  \
+          TOOL_CHANGED             `# BUILT_INDICATOR`   \
+          "$BUILD_TOOL_IMAGE_EXISTS"
+
+  build_tool:
+    stage: tool
+    title: Build Tool Image
+    type: build
+    when:
+      condition:
+        all:
+          toolChanged: '"${{TOOL_CHANGED}}" == "true"'
+    image_name: backend-trading/matchermanagement/codefresh/tool
+    tag: ${{CF_BRANCH_TAG_NORMALIZED}}
+    dockerfile: .codefresh/images/tool/Dockerfile
+
+  push_tool:
+    stage: tool
+    title: Push Tool Image
+    description: Push tool docker image to Nexus
+    type: push
+    when:
+      condition:
+        all:
+          toolChanged: '"${{TOOL_CHANGED}}" == "true"'
+    registry: nexus_pbs_one
+    candidate: ${{build_tool}}
+    tag: '${{CF_BRANCH_TAG_NORMALIZED}}'
+
+  #
+  # ---- Common ---- #
+  #
+
+  common_image_exists:
+    stage: common
+    title: Common Image Doesnt Exists?
+    image: nexus.pbs.one/backend-trading/matchermanagement/codefresh/tool:${{CF_BRANCH_TAG_NORMALIZED}}
+    working_directory: ${{main_clone}}
+    commands:
+      - |-
+        ./.codefresh/bin/image-exists.sh                                 \
+          "nexus.pbs.one/backend-trading/eventmanagement/python-builder" \
+          ${{CF_BRANCH_TAG_NORMALIZED}}                                  \
+          COMMON_IMAGE_DOESNT_EXIST        `# CF_EXPORT_VAR`             \
+          "true"
+      - |-
+        ./.codefresh/bin/image-exists.sh                                 \
+          "nexus.pbs.one/backend-trading/eventmanagement/python-builder" \
+          ${{CF_BRANCH_TAG_NORMALIZED}}-dev                              \
+          COMMON_DEV_IMAGE_DOESNT_EXIST     `# CF_EXPORT_VAR`            \
+          "$COMMON_IMAGE_DOESNT_EXIST"
+      - echo -e "$COMMON_DEV_IMAGE_DOESNT_EXIST ${COMMON_IMAGE_DOESNT_EXIST}"
+
+  # build_common_if_changed:
+  #   stage: common
+  #   title: Check If Common Has Changed
+  #   image: codefresh/cli
+  #   working_directory: ${{main_clone}}
+  #   commands:
+  #     - |-
+  #       ./.codefresh/cf-export-if-changed.sh      \
+  #         "$changed_things"                       \
+  #         python/common      `# WATCHED_LOCATION` \
+  #         COMMON_CHANGED     `# BUILT_INDICATOR`  \
+  #         "$COMMON_IMAGES_DONT_EXIST"
+
+  common_build_image:
+    stage: common
+    title: Build Common Docker Images
+    type: parallel
+    # when:
+    #   condition:
+    #     all:
+    #       commonChanged: '"${{COMMON_CHANGED}}" == "true"'
+    steps:
+      python_builder:
+        title: Building python common builder image
+        type: build
+        image_name: backend-trading/matchermanagement/python-common
+        tag: '${{CF_BRANCH_TAG_NORMALIZED}}'
+        working_directory: ./python/common
+        build_arguments:
+          - PYTHON_VERSION=${{PYTHON_VERSION}}
+          - ALPINE_VERSION=${{ALPINE_VERSION}}
+          - BASE_TAG=${{CF_BRANCH_TAG_NORMALIZED}}
+      python_builder_dev:
+        title: Building development python common builder image
+        type: build
+        image_name: backend-trading/matchermanagement/python-common
+        tag: '${{CF_BRANCH_TAG_NORMALIZED}}-dev'
+        working_directory: ./python/common
+        dockerfile: Dockerfile.dev
+        build_arguments:
+          - PYTHON_VERSION=${{PYTHON_VERSION}}
+          - ALPINE_VERSION=${{ALPINE_VERSION}}
+          - BASE_TAG=${{CF_BRANCH_TAG_NORMALIZED}}-dev
+
+  common_tests:
+    stage: common
+    title: Run Unit & Integration Tests for common
+    # when:
+    #   condition:
+    #     all:
+    #       commonChanged: '"${{COMMON_CHANGED}}" == "true"'
+    type: parallel
+    steps:
+      unittest_em_stubs:
+        title: mm-stubs Unit Test
+        image: ${{python_builder}}
+        working_directory: /usr/src/common/mm_stubs
+        commands:
+          - export PIPENV_VENV_IN_PROJECT=true
+          - pipenv run python setup.py install
+          - pipenv install --ignore-pipfile --deploy --dev
+          - cp -r /usr/src/common/mm_stubs/.venv /opt/.venv/
+          - PATH=/opt/.venv/bin:$PATH
+          - pytest tests/
+
+  # CHRISTOS: Example intergation test for docker-compose
+  #     integrationtest_kafkalib:
+  #       title: Kafkalib Integration Test
+  #       image: nexus.pbs.one/backend-trading/eventmanagement/codefresh/tool:${{CF_BRANCH_TAG_NORMALIZED}}
+  #       working_directory: ./python/common/kafkalib
+  #       commands:
+  #         - free -m
+  #         - docker stats --all --no-stream
+  #         - docker network ls
+  #         - make integration-tests NETWORK=${{CF_BUILD_ID}}
+  #         - docker network ls
+  #         - free -m
+  #         - docker stats --all --no-stream
+  #       retry:
+  #         maxAttempts: 5
+  #         delay: 5
+  #         exponentialFactor: 2
+
+  common_push_image:
+    stage: common
+    title: Push Common Docker Images to Nexus
+    type: parallel
+    # when:
+    #   condition:
+    #     all:
+    #       commonChanged: '"${{COMMON_CHANGED}}" == "true"'
+    steps:
+      push_python_builder:
+        title: Push python common builder image
+        type: push
+        registry: nexus_pbs_one
+        candidate: ${{python_builder}}
+        tag: '${{CF_BRANCH_TAG_NORMALIZED}}'
+      push_python_builder_dev:
+        title: Push python development common builder image
+        type: push
+        registry: nexus_pbs_one
+        candidate: ${{python_builder_dev}}
+        tag: '${{CF_BRANCH_TAG_NORMALIZED}}-dev'
+
+  # 
+  # ---- Infra ----
+  #
+
+  infra_get_helm_chart:
+    stage: infra
+    title: Grab current infra chart version and calculate new version
+    image: codefresh/cfstep-helm:2.12.3
+    when:
+      branch:
+        only:
+        - master
+    working_directory: ${{main_clone}}
+    commands:
+      - export HELM_REPO_ACCESS_TOKEN=${{CF_API_KEY}}
+      - export HELM_REPO_AUTH_HEADER=Authorization
+      - helm repo add default ${{CF_CTX_CF_HELM_DEFAULT_URL}}
+      - helm plugin install https://github.com/mbenabda/helm-local-chart-version
+      - ./bin/codefresh/chart-version-bump.sh helm/eventmanagement/charts/infra infra NEW_INFRA_CHART_VERSION
+
+  infra_bump_helm_chart:
+    stage: infra
+    title: Bump helm chart version
+    image: codefresh/cfstep-helm:2.12.3
+    when:
+      branch:
+        only:
+        - master
+    commands:
+      - helm plugin install https://github.com/mbenabda/helm-local-chart-version
+      - helm local-chart-version set -c helm/eventmanagement/charts/infra -v ${NEW_INFRA_CHART_VERSION}
+
+  infra_push_helm_infrastructure_chart:
+    stage: infra
+    title: Infrastructure Chart Push 
+    image: codefresh/cfstep-helm:2.12.3
+    when:
+      branch:
+        only:
+        - master
+    commands:
+      - export HELM_REPO_ACCESS_TOKEN=${{CF_API_KEY}}
+      - export HELM_REPO_AUTH_HEADER=Authorization
+      - helm repo add infra ${{CF_CTX_CF_HELM_DEFAULT_URL}}
+      - helm push helm/eventmanagement/charts/infra infra
+
+  # 
+  # ---- Apps ---- #
+  #
+
+  # CHRISTOS: Missing linting - don't worry
+
+  apps_images:
+    stage: apps_build
+    title: "Build Docker Images"
+    type: parallel
+    # when:
+    #   condition:
+    #     all:
+    #       srcChanged: '"${{APP_CHANGED}}" == "true"'
+    steps:
+      matcher_branch:
+        title: Matcher Branch Tag
+        type: build
+        image_name: backend-trading/matchermanagement/matcher
+        tag: '${{CF_BRANCH_TAG_NORMALIZED}}'
+        working_directory: ./python/apps/matcher
+        build_arguments:
+          - BASE_TAG=${{CF_BRANCH_TAG_NORMALIZED}}
+      matcher_dev:
+        title: Matcher Dev Tag
+        type: build
+        image_name: backend-trading/matchermanagement/matcher
+        tag: '${{CF_BRANCH_TAG_NORMALIZED}}-dev'
+        working_directory: ./python/apps/matcher
+        build_arguments:
+          - BASE_TAG=${{CF_BRANCH_TAG_NORMALIZED}}-dev
+      matcherapi_branch:
+        title: Matcherapi Branch Tag
+        type: build
+        image_name: backend-trading/matchermanagement/matcherapi
+        tag: '${{CF_BRANCH_TAG_NORMALIZED}}'
+        working_directory: ./python/apps/matcherapi
+        build_arguments:
+          - BASE_TAG=${{CF_BRANCH_TAG_NORMALIZED}}
+      matcherapi_dev:
+        title: Matcherapi Dev Tag
+        type: build
+        image_name: backend-trading/matchermanagement/matcherapi
+        tag: '${{CF_BRANCH_TAG_NORMALIZED}}-dev'
+        working_directory: ./python/apps/matcherapi
+        build_arguments:
+          - BASE_TAG=${{CF_BRANCH_TAG_NORMALIZED}}-dev
+      hiernotifier_branch:
+        title: Hiernotifier Branch Tag
+        type: build
+        image_name: backend-trading/matchermanagement/hiernotifier
+        tag: '${{CF_BRANCH_TAG_NORMALIZED}}'
+        working_directory: ./python/apps/hiernotifier
+        build_arguments:
+          - BASE_TAG=${{CF_BRANCH_TAG_NORMALIZED}}
+      hiernotifier_dev:
+        title: Hiernotifier Dev Tag
+        type: build
+        image_name: backend-trading/matchermanagement/hiernotifier
+        tag: '${{CF_BRANCH_TAG_NORMALIZED}}-dev'
+        working_directory: ./python/apps/hiernotifier
+        build_arguments:
+          - BASE_TAG=${{CF_BRANCH_TAG_NORMALIZED}}-dev
+
+  # CHRISTOS: - Uncomment when ready
+  # apps_tests:
+  #   stage: apps
+  #   title: "Run Unit & Integration Tests for Apps"
+  #   type: parallel
+  #   when:
+  #     condition:
+  #       all:
+  #         srcChanged: '"${{APP_CHANGED}}" == "true"'
+  #   steps:
+  #     hiernotifier_unit_tests:
+  #       title: hiernotifier
+  #       image: ${{app_dev}}
+  #       working_directory: /
+  #       commands:
+  #         - export $(cat testing.env | xargs)
+  #         - python -m pytest tests/
+  #     matcher_unit_tests:
+  #       title: Matcher
+  #       image: ${{app_dev}}
+  #       working_directory: /
+  #       commands:
+  #         - export $(cat testing.env | xargs)
+  #         - python -m pytest tests/
+  #     matcherapi_unit_tests:
+  #       title: Matcherapi
+  #       image: ${{app_dev}}
+  #       working_directory: /
+  #       commands:
+  #         - export $(cat testing.env | xargs)
+  #         - python -m pytest tests/
+
+  helm_lint:
+    stage: apps_tests
+    title: Helm Chart Lint
+    image: codefresh/cfstep-helm:2.12.3
+    working_directory: ${{main_clone}}
+    commands:
+      - helm lint helm/eventmanagement/charts/hiernotifier || exit 1
+      - helm lint helm/eventmanagement/charts/matcher || exit 1
+      - helm lint helm/eventmanagement/charts/matcherapi || exit 1
+    # when:
+    #   condition:
+    #     all:
+    #       srcChanged: '"${{APP_CHANGED}}" == "true"'
+
+  push_images:
+    stage: apps_push
+    title: Push Images to Nexus
+    type: parallel
+    # when:
+    #   condition:
+    #     all:
+    #       srcChanged: '"${{APP_CHANGED}}" == "true"'
+    steps:
+      push_hiernotifier_branch:
+        title: Hiernotifier Branch Tag
+        type: push
+        registry: nexus_pbs_one
+        candidate: ${{hiernotifier_branch}}
+        tags: 
+          - '${{CF_BRANCH_TAG_NORMALIZED}}'
+          - '${{CF_BRANCH_TAG_NORMALIZED}}-${{CF_SHORT_REVISION}}'
+      push_hiernotifier_dev:
+        title: Hiernotifier Dev Tag
+        type: push
+        registry: nexus_pbs_one
+        candidate: ${{hiernotifier_dev}}
+        tags: 
+          - '${{CF_BRANCH_TAG_NORMALIZED}}-dev'
+          - '${{CF_BRANCH_TAG_NORMALIZED}}-${{CF_SHORT_REVISION}}-dev'
+      push_matcher_branch:
+        title: Matcher Branch Tag
+        type: push
+        registry: nexus_pbs_one
+        candidate: ${{matcher_branch}}
+        tags: 
+          - '${{CF_BRANCH_TAG_NORMALIZED}}'
+          - '${{CF_BRANCH_TAG_NORMALIZED}}-${{CF_SHORT_REVISION}}'
+      push_matcher_dev:
+        title: Matcher Dev Tag
+        type: push
+        registry: nexus_pbs_one
+        candidate: ${{matcher_dev}}
+        tags: 
+          - '${{CF_BRANCH_TAG_NORMALIZED}}-dev'
+          - '${{CF_BRANCH_TAG_NORMALIZED}}-${{CF_SHORT_REVISION}}-dev'
+      push_matcherapi_branch:
+        title: Matcherapi Branch Tag
+        type: push
+        registry: nexus_pbs_one
+        candidate: ${{matcherapi_branch}}
+        tags: 
+          - '${{CF_BRANCH_TAG_NORMALIZED}}'
+          - '${{CF_BRANCH_TAG_NORMALIZED}}-${{CF_SHORT_REVISION}}'
+      push_matcherapi_dev:
+        title: Matcherapi Dev Tag
+        type: push
+        registry: nexus_pbs_one
+        candidate: ${{matcherapi_dev}}
+        tags: 
+          - '${{CF_BRANCH_TAG_NORMALIZED}}-dev'
+          - '${{CF_BRANCH_TAG_NORMALIZED}}-${{CF_SHORT_REVISION}}-dev'
+
+  get_helm_charts:
+    stage: apps_push
+    title: Grab current chart versions and calculate new versions
+    image: codefresh/cfstep-helm:2.12.3
+    when:
+      branch:
+        only:
+        - master
+    working_directory: ${{main_clone}}
+    commands:
+      - export HELM_REPO_ACCESS_TOKEN=${{CF_API_KEY}}
+      - export HELM_REPO_AUTH_HEADER=Authorization
+      - helm repo add default ${{CF_CTX_CF_HELM_DEFAULT_URL}}
+      - helm plugin install https://github.com/mbenabda/helm-local-chart-version
+      - ./.codefresh/bin/chart-version-bump.sh helm/eventmanagement/charts/hiernotifier hiernotifier NEW_HIERNOTIFIER_CHART_VERSION
+      - ./.codefresh/bin/chart-version-bump.sh helm/eventmanagement/charts/matcher matcher NEW_MATCHER_CHART_VERSION
+      - ./.codefresh/bin/chart-version-bump.sh helm/eventmanagement/charts/matcherapi matcherapi NEW_MATCHERAPI_CHART_VERSION
+
+  bump_helm_charts:
+    stage: apps_push
+    title: Bump helm chart versions
+    image: codefresh/cfstep-helm:2.12.3
+    when:
+      branch:
+        only:
+        - master
+    commands:
+      - helm plugin install https://github.com/mbenabda/helm-local-chart-version
+      - helm local-chart-version set -c helm/eventmanagement/charts/hiernotifier -v ${NEW_HIERNOTIFIER_CHART_VERSION}
+      - helm local-chart-version set -c helm/eventmanagement/charts/matcher -v ${NEW_MATCHER_CHART_VERSION}
+      - helm local-chart-version set -c helm/eventmanagement/charts/matcherapi -v ${NEW_MATCHERAPI_CHART_VERSION}
+
+  push_helm_chart:
+    stage: apps_push
+    title: Push Helm Charts for Apps
+    type: parallel
+    when:
+      branch:
+        only:
+        - master
+    steps:
+      push_helm_hiernotifier:
+        title: Hiernotifier Chart Push
+        image: codefresh/cfstep-helm:2.12.3
+        environment:
+          - ACTION=push
+          - CHART_REF=helm/eventmanagement/charts/hiernotifier
+      push_helm_matcher:
+        title: Matcher Chart Push
+        image: codefresh/cfstep-helm:2.12.3
+        environment:
+          - ACTION=push
+          - CHART_REF=helm/eventmanagement/charts/matcher
+
+
+      push_helm_matcherapi:
+        title: Matcherapi Chart Push
+        image: codefresh/cfstep-helm:2.12.3
+        environment:
+          - ACTION=push
+          - CHART_REF=helm/eventmanagement/charts/matcherapi
+
+  # ---- Mark Build Status ---- #
+  mark_pipeline_status:
+    fail_fast: true
+    stage: notification
+    image: alpine:latest
+    title: Mark pipeline status
+    commands:
+    - echo "Pipeline failed"
+    - exit 1
+    when:
+      condition:
+        any:
+          cond1: main_clone.result == 'failure'
+          cond2: get_changed_setup_envs.result == 'failure'
+          cond3: build_tool_image_exists.result == 'failure'
+          cond4: build_tool_if_changed.result == 'failure'
+          cond5: build_tool.result == 'failure'
+          cond6: push_tool.result == 'failure'
